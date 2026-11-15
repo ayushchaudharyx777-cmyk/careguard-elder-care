@@ -4,10 +4,11 @@ from datetime import datetime, timedelta
 from email.message import EmailMessage
 import logging
 import smtplib
+import threading
 from zoneinfo import ZoneInfo
 
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, selectinload
 
 from app.core import (
     Appointment,
@@ -21,6 +22,9 @@ from app.core import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Single scheduler instance lock to prevent duplicate overlapping cycle executions
+_cycle_lock = threading.Lock()
 
 
 def send_email(to_email: str, subject: str, body: str) -> bool:
@@ -127,7 +131,7 @@ def _process_slot(
     now: datetime,
     patient: Patient,
 ) -> tuple[int, int]:
-  """Process a single scheduled dose slot.
+  """Process a single scheduled dose slot (fallback/unit helper).
 
   Returns (upcoming_count, missed_count).
   """
@@ -203,7 +207,7 @@ def _process_slot(
 def _process_appointments(
     db: Session, patient: Patient, now: datetime
 ) -> int:
-  """Process appointments starting in the next 24 hours.
+  """Process appointments starting in the next 24 hours (fallback/unit helper).
 
   Returns count of notifications sent.
   """
@@ -238,53 +242,201 @@ def _process_appointments(
 
 
 def run_reminder_cycle(now: datetime | None = None) -> dict[str, int]:
-  """Run the reminder cycle across all patients and active medications.
+  """Run the bulk reminder cycle across all patients, active medications, and appointments.
 
-  Wrap in a session and commit once. On IntegrityError, rollback and return zeros.
+  Bulk-loads medications, members, existing dose logs and appointments in single queries,
+  computes status updates in memory, and bulk inserts new logs.
+  Protected by a single-instance lock to prevent overlapping runs.
+  Idempotent: running repeatedly produces no duplicate logs or notifications.
   """
-  if now is None:
-    now = utcnow()
-
-  db: Session = SessionLocal()
-  upcoming_count = 0
-  missed_count = 0
-  appointments_count = 0
+  if not _cycle_lock.acquire(blocking=False):
+    logger.warning("Reminder cycle is already executing; skipping duplicate execution.")
+    return {"upcoming": 0, "missed": 0, "appointments": 0}
 
   try:
-    patients = db.query(Patient).all()
-    for patient in patients:
-      medications = (
-          db.query(Medication)
-          .filter(
-              Medication.patient_id == patient.id,
-              Medication.active == True,
+    if now is None:
+      now = utcnow()
+
+    db: Session = SessionLocal()
+    upcoming_count = 0
+    missed_count = 0
+    appointments_count = 0
+
+    try:
+      # Bulk load patients along with members and active medications
+      patients = (
+          db.query(Patient)
+          .options(
+              selectinload(Patient.members),
+              selectinload(Patient.medications),
           )
           .all()
       )
-      for med in medications:
-        slots = scheduled_slots(med, patient.timezone, now)
+      if not patients:
+        return {"upcoming": 0, "missed": 0, "appointments": 0}
+
+      patient_map: dict[int, Patient] = {p.id: p for p in patients}
+
+      # Compute slots for all active medications
+      candidate_slots_by_med: dict[int, list[datetime]] = {}
+      med_map: dict[int, tuple[Medication, Patient]] = {}
+      all_med_ids: list[int] = []
+      all_slots_set: set[datetime] = set()
+
+      for patient in patients:
+        for med in patient.medications:
+          if not med.active:
+            continue
+          slots = scheduled_slots(med, patient.timezone, now)
+          if slots:
+            candidate_slots_by_med[med.id] = slots
+            med_map[med.id] = (med, patient)
+            all_med_ids.append(med.id)
+            all_slots_set.update(slots)
+
+      # Check upcoming appointments starting within the next 24 hours
+      window_end = now + timedelta(hours=24)
+      patient_ids = list(patient_map.keys())
+      appointments = (
+          db.query(Appointment)
+          .filter(
+              Appointment.patient_id.in_(patient_ids),
+              Appointment.reminder_sent == False,
+              Appointment.starts_at >= now,
+              Appointment.starts_at <= window_end,
+          )
+          .all()
+      )
+
+      # Early exit if there are neither candidate slots nor appointments
+      if not all_med_ids and not appointments:
+        return {"upcoming": 0, "missed": 0, "appointments": 0}
+
+      # Bulk load existing dose logs for all candidate medications and slots
+      existing_log_map: dict[tuple[int, datetime], DoseLog] = {}
+      if all_med_ids and all_slots_set:
+        existing_logs = (
+            db.query(DoseLog)
+            .filter(
+                DoseLog.medication_id.in_(all_med_ids),
+                DoseLog.scheduled_for.in_(list(all_slots_set)),
+            )
+            .all()
+        )
+        for log in existing_logs:
+          existing_log_map[(log.medication_id, log.scheduled_for)] = log
+
+      upcoming_window = timedelta(minutes=settings.UPCOMING_WINDOW_MINUTES)
+      missed_window = timedelta(minutes=settings.MISSED_AFTER_MINUTES)
+      notifications_to_send: list[tuple[Patient, str, str]] = []
+      new_logs: list[DoseLog] = []
+
+      # In-memory slot evaluation
+      for med_id, slots in candidate_slots_by_med.items():
+        med, patient = med_map[med_id]
         for slot in slots:
-          up, mi = _process_slot(db, med, slot, now, patient)
-          upcoming_count += up
-          missed_count += mi
+          log = existing_log_map.get((med_id, slot))
+          if log is None:
+            if now < slot - upcoming_window:
+              continue
 
-      app_cnt = _process_appointments(db, patient, now)
-      appointments_count += app_cnt
+            if now >= slot + missed_window:
+              missed_log = DoseLog(
+                  medication_id=med.id,
+                  scheduled_for=slot,
+                  status="missed",
+                  created_at=now,
+                  updated_at=now,
+              )
+              new_logs.append(missed_log)
+              existing_log_map[(med_id, slot)] = missed_log
+              subject = "Missed dose"
+              body = (
+                  f"Missed dose alert for patient {patient.name}.\n"
+                  f"Medication: {med.name} ({med.dosage})\n"
+                  f"Scheduled (UTC): {slot.strftime('%Y-%m-%d %H:%M')}\n"
+                  f"Instructions: {med.instructions or 'None'}"
+              )
+              notifications_to_send.append((patient, subject, body))
+              missed_count += 1
+            else:
+              pending_log = DoseLog(
+                  medication_id=med.id,
+                  scheduled_for=slot,
+                  status="pending",
+                  created_at=now,
+                  updated_at=now,
+              )
+              new_logs.append(pending_log)
+              existing_log_map[(med_id, slot)] = pending_log
+              subject = "Medicine reminder"
+              body = (
+                  f"Medicine reminder for patient {patient.name}.\n"
+                  f"Medication: {med.name} ({med.dosage})\n"
+                  f"Scheduled (UTC): {slot.strftime('%Y-%m-%d %H:%M')}\n"
+                  f"Instructions: {med.instructions or 'None'}"
+              )
+              notifications_to_send.append((patient, subject, body))
+              upcoming_count += 1
 
-    db.commit()
-    return {
-        "upcoming": upcoming_count,
-        "missed": missed_count,
-        "appointments": appointments_count,
-    }
-  except IntegrityError as e:
-    db.rollback()
-    logger.warning("IntegrityError encountered in reminder cycle: %s", e)
-    return {"upcoming": 0, "missed": 0, "appointments": 0}
-  except Exception as e:
-    db.rollback()
-    logger.error("Unexpected error in reminder cycle: %s", e)
-    raise
+          elif log.status == "pending" and now >= slot + missed_window:
+            log.status = "missed"
+            log.updated_at = now
+            subject = "Missed dose"
+            body = (
+                f"Missed dose alert for patient {patient.name}.\n"
+                f"Medication: {med.name} ({med.dosage})\n"
+                f"Scheduled (UTC): {slot.strftime('%Y-%m-%d %H:%M')}\n"
+                f"Instructions: {med.instructions or 'None'}"
+            )
+            notifications_to_send.append((patient, subject, body))
+            missed_count += 1
+
+      if new_logs:
+        db.add_all(new_logs)
+
+      # Process appointments
+      for appt in appointments:
+        p = patient_map.get(appt.patient_id)
+        if not p:
+          continue
+        subject = "Appointment"
+        body = (
+            f"Upcoming appointment reminder for patient {p.name}.\n"
+            f"Doctor: {appt.doctor_name}\n"
+            f"Specialty: {appt.specialty or 'General'}\n"
+            f"Location: {appt.location or 'Not specified'}\n"
+            f"Scheduled at (UTC): {appt.starts_at.strftime('%Y-%m-%d %H:%M')}\n"
+            f"Notes: {appt.notes or 'None'}"
+        )
+        notifications_to_send.append((p, subject, body))
+        appt.reminder_sent = True
+        appointments_count += 1
+
+      db.commit()
+
+      # Send notifications to preloaded members
+      for p, subj, bdy in notifications_to_send:
+        for member in p.members:
+          try:
+            send_email(member.email, subj, bdy)
+          except Exception as e:
+            logger.error("Failed to notify member %s: %s", member.email, e)
+
+      return {
+          "upcoming": upcoming_count,
+          "missed": missed_count,
+          "appointments": appointments_count,
+      }
+    except IntegrityError as e:
+      db.rollback()
+      logger.warning("IntegrityError encountered in reminder cycle: %s", e)
+      return {"upcoming": 0, "missed": 0, "appointments": 0}
+    except Exception as e:
+      db.rollback()
+      logger.error("Unexpected error in reminder cycle: %s", e)
+      raise
+    finally:
+      db.close()
   finally:
-    db.close()
-
+    _cycle_lock.release()
