@@ -1,0 +1,24 @@
+"""Application-wide constants and configuration values for CareGuard."""
+
+# Authentication and security
+PBKDF2_ITERATIONS: int = 310_000
+SALT_BYTES: int = 16
+SESSION_TOKEN_BYTES: int = 32
+DEFAULT_SESSION_HOURS: int = 12
+MAX_FAILED_LOGIN_ATTEMPTS: int = 5
+LOCKOUT_DURATION_MINUTES: int = 15
+
+# Reminder and scheduler windows
+DEFAULT_UPCOMING_WINDOW_MINUTES: int = 15
+DEFAULT_MISSED_AFTER_MINUTES: int = 60
+DEFAULT_REMINDER_INTERVAL_SECONDS: int = 60
+APPOINTMENT_REMINDER_WINDOW_HOURS: int = 24
+
+# Network, database, and pagination settings
+DEFAULT_SMTP_PORT: int = 587
+MAX_PAGINATION_LIMIT: int = 500
+GZIP_MINIMUM_SIZE: int = 500
+STATIC_CACHE_MAX_AGE_SECONDS: int = 3600
+DB_POOL_SIZE: int = 5
+DB_MAX_OVERFLOW: int = 10
+DB_POOL_RECYCLE_SECONDS: int = 1800
