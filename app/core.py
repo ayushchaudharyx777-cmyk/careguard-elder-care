@@ -14,6 +14,7 @@ from sqlalchemy import (
     Date,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     JSON,
     String,
@@ -71,10 +72,17 @@ class Settings:
 
 settings = Settings()
 
-connect_args = (
-    {"check_same_thread": False} if "sqlite" in settings.DATABASE_URL else {}
-)
-engine = create_engine(settings.DATABASE_URL, connect_args=connect_args)
+engine_kwargs: dict = {
+    "pool_pre_ping": True,
+    "pool_recycle": 1800,
+}
+if "sqlite" in settings.DATABASE_URL:
+  engine_kwargs["connect_args"] = {"check_same_thread": False}
+else:
+  engine_kwargs["pool_size"] = 5
+  engine_kwargs["max_overflow"] = 10
+
+engine = create_engine(settings.DATABASE_URL, **engine_kwargs)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
 
@@ -171,6 +179,8 @@ class Member(Base):
       DateTime, default=utcnow, nullable=False
   )
 
+  __table_args__ = (Index("ix_members_patient_id", "patient_id"),)
+
   patient: Mapped["Patient"] = relationship("Patient", back_populates="members")
   sessions: Mapped[list["AuthSession"]] = relationship(
       "AuthSession", back_populates="member", cascade="all, delete-orphan"
@@ -192,6 +202,11 @@ class AuthSession(Base):
       DateTime, default=utcnow, nullable=False
   )
 
+  __table_args__ = (
+      Index("ix_auth_sessions_member_id", "member_id"),
+      Index("ix_auth_sessions_token_expires", "token_hash", "expires_at"),
+  )
+
   member: Mapped["Member"] = relationship("Member", back_populates="sessions")
 
 
@@ -211,6 +226,11 @@ class Medication(Base):
   active: Mapped[bool] = mapped_column(Boolean, default=True, nullable=False)
   created_at: Mapped[datetime] = mapped_column(
       DateTime, default=utcnow, nullable=False
+  )
+
+  __table_args__ = (
+      Index("ix_medications_patient_id", "patient_id"),
+      Index("ix_medications_patient_active", "patient_id", "active"),
   )
 
   patient: Mapped["Patient"] = relationship(
@@ -243,6 +263,15 @@ class DoseLog(Base):
       UniqueConstraint(
           "medication_id", "scheduled_for", name="uq_medication_scheduled_for"
       ),
+      Index("ix_dose_logs_medication_id", "medication_id"),
+      Index(
+          "ix_dose_logs_med_sched_status",
+          "medication_id",
+          "scheduled_for",
+          "status",
+      ),
+      Index("ix_dose_logs_scheduled_for", "scheduled_for"),
+      Index("ix_dose_logs_status", "status"),
   )
 
   medication: Mapped["Medication"] = relationship(
@@ -267,6 +296,12 @@ class Appointment(Base):
   )
   created_at: Mapped[datetime] = mapped_column(
       DateTime, default=utcnow, nullable=False
+  )
+
+  __table_args__ = (
+      Index("ix_appointments_patient_starts", "patient_id", "starts_at"),
+      Index("ix_appointments_starts_at", "starts_at"),
+      Index("ix_appointments_reminder_sent", "reminder_sent"),
   )
 
   patient: Mapped["Patient"] = relationship(

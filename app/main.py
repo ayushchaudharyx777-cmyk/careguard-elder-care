@@ -10,7 +10,8 @@ import os
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy.orm import Session
+from sqlalchemy import func
+from sqlalchemy.orm import Session, joinedload, selectinload
 
 from app.core import (
     Appointment,
@@ -118,6 +119,7 @@ def get_current_member(
   now = utcnow()
   session_obj = (
       db.query(AuthSession)
+      .options(joinedload(AuthSession.member).joinedload(Member.patient))
       .filter(
           AuthSession.token_hash == token_hash,
           AuthSession.expires_at > now,
@@ -125,22 +127,13 @@ def get_current_member(
       .first()
   )
 
-  if not session_obj:
+  if not session_obj or not session_obj.member:
     raise HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
         detail="Invalid or expired session token",
     )
 
-  member = (
-      db.query(Member).filter(Member.id == session_obj.member_id).first()
-  )
-  if not member:
-    raise HTTPException(
-        status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Member not found",
-    )
-
-  return member
+  return session_obj.member
 
 
 @app.get("/")
@@ -288,9 +281,7 @@ def get_me(
     current_member: Member = Depends(get_current_member),
     db: Session = Depends(get_db),
 ):
-  patient = (
-      db.query(Patient).filter(Patient.id == current_member.patient_id).first()
-  )
+  patient = current_member.patient
   return {
       "member": MemberOut.model_validate(current_member),
       "patient": {
@@ -499,7 +490,8 @@ def get_doses(
     db: Session = Depends(get_db),
 ):
   query = (
-      db.query(DoseLog, Medication)
+      db.query(DoseLog)
+      .options(joinedload(DoseLog.medication))
       .join(Medication, DoseLog.medication_id == Medication.id)
       .filter(Medication.patient_id == current_member.patient_id)
   )
@@ -512,15 +504,15 @@ def get_doses(
       {
           "id": log.id,
           "medication_id": log.medication_id,
-          "medication_name": med.name,
-          "dosage": med.dosage,
-          "instructions": med.instructions,
+          "medication_name": log.medication.name if log.medication else "",
+          "dosage": log.medication.dosage if log.medication else "",
+          "instructions": log.medication.instructions if log.medication else "",
           "scheduled_for": log.scheduled_for.isoformat(),
           "status": log.status,
           "updated_at": log.updated_at.isoformat(),
           "created_at": log.created_at.isoformat(),
       }
-      for log, med in doses
+      for log in doses
   ]
 
 
@@ -567,20 +559,22 @@ def get_adherence(
   now = utcnow()
   cutoff = now - timedelta(days=days)
 
-  doses = (
-      db.query(DoseLog)
+  status_counts = (
+      db.query(DoseLog.status, func.count(DoseLog.id))
       .join(Medication, DoseLog.medication_id == Medication.id)
       .filter(
           Medication.patient_id == current_member.patient_id,
           DoseLog.scheduled_for >= cutoff,
           DoseLog.scheduled_for <= now,
       )
+      .group_by(DoseLog.status)
       .all()
   )
 
-  taken = sum(1 for d in doses if d.status == "taken")
-  skipped = sum(1 for d in doses if d.status == "skipped")
-  missed = sum(1 for d in doses if d.status == "missed")
+  counts = dict(status_counts)
+  taken = counts.get("taken", 0)
+  skipped = counts.get("skipped", 0)
+  missed = counts.get("missed", 0)
   total = taken + skipped + missed
 
   adherence = round((taken / total) * 100, 1) if total > 0 else None
