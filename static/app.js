@@ -61,20 +61,25 @@
     clearElement(userBar);
 
     try {
-      const setupStatus = await api("/api/setup/status");
-      if (!setupStatus.setup_complete) {
-        renderSetupView();
-        return;
-      }
-
-      if (!state.token) {
+      if (state.token) {
+        const [setupStatus, meData] = await Promise.all([
+          api("/api/setup/status"),
+          api("/api/me"),
+        ]);
+        if (!setupStatus.setup_complete) {
+          renderSetupView();
+          return;
+        }
+        state.me = meData;
+        renderAppShell();
+      } else {
+        const setupStatus = await api("/api/setup/status");
+        if (!setupStatus.setup_complete) {
+          renderSetupView();
+          return;
+        }
         renderLoginView();
-        return;
       }
-
-      const meData = await api("/api/me");
-      state.me = meData;
-      renderAppShell();
     } catch (err) {
       if (!state.token) {
         renderLoginView(err.message);

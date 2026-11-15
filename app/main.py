@@ -12,6 +12,7 @@ from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload, selectinload
+from starlette.middleware.gzip import GZipMiddleware
 
 from app.core import (
     Appointment,
@@ -77,6 +78,7 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="CareGuard API", lifespan=lifespan)
+app.add_middleware(GZipMiddleware, minimum_size=500)
 
 
 @app.middleware("http")
@@ -89,6 +91,11 @@ async def add_security_headers(request: Request, call_next):
       "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src"
       " 'self'; frame-ancestors 'none'"
   )
+  path = request.url.path
+  if path.startswith("/static/"):
+    response.headers["Cache-Control"] = "public, max-age=3600"
+  elif path == "/" or path.endswith(".html"):
+    response.headers["Cache-Control"] = "no-cache, no-store, must-revalidate"
   return response
 
 
@@ -294,15 +301,21 @@ def get_me(
 
 @app.get("/api/members", response_model=list[MemberOut])
 def get_members(
+    limit: int | None = Query(default=None, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     current_member: Member = Depends(get_current_member),
     db: Session = Depends(get_db),
 ):
-  members = (
+  query = (
       db.query(Member)
       .filter(Member.patient_id == current_member.patient_id)
       .order_by(Member.id.asc())
-      .all()
   )
+  if limit is not None:
+    query = query.limit(min(limit, 500))
+  if offset > 0:
+    query = query.offset(offset)
+  members = query.all()
   return [MemberOut.model_validate(m) for m in members]
 
 
@@ -384,15 +397,21 @@ def delete_member(
 
 @app.get("/api/medications", response_model=list[MedicationOut])
 def get_medications(
+    limit: int | None = Query(default=None, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     current_member: Member = Depends(get_current_member),
     db: Session = Depends(get_db),
 ):
-  meds = (
+  query = (
       db.query(Medication)
       .filter(Medication.patient_id == current_member.patient_id)
       .order_by(Medication.id.asc())
-      .all()
   )
+  if limit is not None:
+    query = query.limit(min(limit, 500))
+  if offset > 0:
+    query = query.offset(offset)
+  meds = query.all()
   return [MedicationOut.model_validate(m) for m in meds]
 
 
@@ -486,6 +505,8 @@ def delete_medication(
 @app.get("/api/doses")
 def get_doses(
     days: int | None = Query(default=None),
+    limit: int | None = Query(default=None, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     current_member: Member = Depends(get_current_member),
     db: Session = Depends(get_db),
 ):
@@ -499,7 +520,13 @@ def get_doses(
     cutoff = utcnow() - timedelta(days=days)
     query = query.filter(DoseLog.scheduled_for >= cutoff)
 
-  doses = query.order_by(DoseLog.scheduled_for.desc()).all()
+  query = query.order_by(DoseLog.scheduled_for.desc())
+  if limit is not None:
+    query = query.limit(min(limit, 500))
+  if offset > 0:
+    query = query.offset(offset)
+
+  doses = query.all()
   return [
       {
           "id": log.id,
@@ -591,15 +618,21 @@ def get_adherence(
 
 @app.get("/api/appointments", response_model=list[AppointmentOut])
 def get_appointments(
+    limit: int | None = Query(default=None, ge=1, le=500),
+    offset: int = Query(default=0, ge=0),
     current_member: Member = Depends(get_current_member),
     db: Session = Depends(get_db),
 ):
-  appts = (
+  query = (
       db.query(Appointment)
       .filter(Appointment.patient_id == current_member.patient_id)
       .order_by(Appointment.starts_at.asc())
-      .all()
   )
+  if limit is not None:
+    query = query.limit(min(limit, 500))
+  if offset > 0:
+    query = query.offset(offset)
+  appts = query.all()
   return [AppointmentOut.model_validate(a) for a in appts]
 
 
